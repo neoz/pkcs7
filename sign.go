@@ -22,6 +22,7 @@ type SignedData struct {
 	sd                  signedData
 	certs               []*x509.Certificate
 	data, messageDigest []byte
+	precomputed         bool // messageDigest was supplied by NewSignedDataFromDigest
 	digestOid           asn1.ObjectIdentifier
 	encryptionOid       asn1.ObjectIdentifier
 }
@@ -43,6 +44,24 @@ func NewSignedData(data []byte) (*SignedData, error) {
 		Version:     1,
 	}
 	return &SignedData{sd: sd, data: data, digestOid: OIDDigestAlgorithmSHA1}, nil
+}
+
+// NewSignedDataFromDigest initializes a detached PKCS7 SignedData struct
+// from the message digest of content the caller has already hashed, so large
+// content never has to be held in memory. The digest must match the
+// algorithm set with SetDigestAlgorithm (SHA1 by default); AddSigner and
+// AddSignerChain return an error otherwise. SignWithoutAttr is not supported
+// because it signs the content itself.
+func NewSignedDataFromDigest(digest []byte) *SignedData {
+	return &SignedData{
+		sd: signedData{
+			ContentInfo: contentInfo{ContentType: OIDData},
+			Version:     1,
+		},
+		messageDigest: append([]byte(nil), digest...),
+		precomputed:   true,
+		digestOid:     OIDDigestAlgorithmSHA1,
+	}
 }
 
 // SignerInfoConfig are optional values to include when adding a signer
@@ -179,9 +198,15 @@ func (sd *SignedData) AddSignerChain(ee *x509.Certificate, keyOrSigner interface
 	if err != nil {
 		return err
 	}
-	h := hash.New()
-	h.Write(sd.data)
-	sd.messageDigest = h.Sum(nil)
+	if sd.precomputed {
+		if len(sd.messageDigest) != hash.Size() {
+			return fmt.Errorf("pkcs7: precomputed digest is %d bytes, %s requires %d", len(sd.messageDigest), hash, hash.Size())
+		}
+	} else {
+		h := hash.New()
+		h.Write(sd.data)
+		sd.messageDigest = h.Sum(nil)
+	}
 	attrs := &attributes{}
 	attrs.Add(OIDAttributeContentType, sd.sd.ContentInfo.ContentType)
 	attrs.Add(OIDAttributeMessageDigest, sd.messageDigest)
@@ -250,6 +275,9 @@ func (sd *SignedData) AddSignerChain(ee *x509.Certificate, keyOrSigner interface
 // shouldn't do unless you're maintaining backward compatibility for old
 // applications. The signer can be either a crypto.Signer or crypto.PrivateKey.
 func (sd *SignedData) SignWithoutAttr(ee *x509.Certificate, keyOrSigner interface{}, config SignerInfoConfig) error {
+	if sd.precomputed {
+		return errors.New("pkcs7: SignWithoutAttr requires content, not a precomputed digest")
+	}
 	algorithm, err := getCMSSignerAlgorithm(keyOrSigner, sd.digestOid, sd.encryptionOid)
 	if err != nil {
 		return err
